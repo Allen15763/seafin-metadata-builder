@@ -18,6 +18,7 @@ import logging
 from ..config import SchemaConfig, ColumnSpec
 from ..transformers import ColumnMapper, SafeTypeCaster
 from ..validation import CircuitBreaker
+from ..reporter import CastFailureDetail, ErrorReport
 
 
 class SilverProcessor:
@@ -62,8 +63,9 @@ class SilverProcessor:
         self,
         df: pd.DataFrame,
         schema_config: SchemaConfig,
-        validate: bool = True
-    ) -> pd.DataFrame:
+        validate: bool = True,
+        return_report: bool = False,
+    ) -> "pd.DataFrame | tuple[pd.DataFrame, ErrorReport]":
         """
         處理 Silver 層邏輯
 
@@ -78,16 +80,21 @@ class SilverProcessor:
             df: Bronze 層 DataFrame
             schema_config: Schema 配置
             validate: 是否執行 Circuit Breaker 檢查
+            return_report: 為 True 時回傳 (df, ErrorReport) tuple；
+                           CircuitBreaker 觸發時不拋出例外，改存入 report。
+                           預設 False，行為與原先完全相同。
 
         Returns:
-            pd.DataFrame: 清洗後的 DataFrame
+            pd.DataFrame（return_report=False）或
+            tuple[pd.DataFrame, ErrorReport]（return_report=True）
 
         Raises:
             SchemaValidationError: 必要欄位缺失
-            CircuitBreakerError: NULL 比例超過閾值
+            CircuitBreakerError: NULL 比例超過閾值（僅 return_report=False 時）
 
         Example:
             >>> df_clean = processor.process(df_bronze, schema_config)
+            >>> df_clean, report = processor.process(df_bronze, schema_config, return_report=True)
         """
         self.logger.info(f"開始 Silver 處理 ({len(df)} 行)")
 
@@ -103,10 +110,21 @@ class SilverProcessor:
         df = self.column_mapper.apply_defaults(df, schema_config.columns)
 
         # 3. 安全類型轉換
+        if return_report:
+            # 保留 cast 前的字串值，用於事後比對哪些 row 轉換失敗
+            df_pre_cast = df.copy()
+
         df = self.type_caster.cast_columns(df, schema_config.columns)
         cast_summary = self.type_caster.get_cast_summary()
         if cast_summary["total_failures"] > 0:
             self.logger.info(f"類型轉換摘要: {cast_summary['failures_by_column']}")
+
+        # 若需要 report，收集行級別轉換失敗詳情
+        cast_failure_details: list[CastFailureDetail] = []
+        if return_report:
+            cast_failure_details = self._collect_cast_failures(
+                df_pre_cast, df, schema_config.columns
+            )
 
         # 4. 過濾空行
         if schema_config.filter_empty_rows:
@@ -117,16 +135,83 @@ class SilverProcessor:
                 self.logger.info(f"過濾 {removed} 筆空行")
 
         # 5. Circuit Breaker 檢查
+        cb_result = None
         if validate:
             breaker = self.circuit_breaker or CircuitBreaker(
                 threshold=schema_config.circuit_breaker_threshold,
                 logger=self.logger
             )
-            breaker.check_and_raise(df, schema_config.columns)
-            self.logger.debug("Circuit Breaker 檢查通過")
+            if return_report:
+                # report 模式：捕捉結果而不拋出例外
+                cb_result = breaker.check(df, schema_config.columns)
+                if cb_result.is_tripped:
+                    self.logger.warning(
+                        f"Circuit Breaker 觸發（已記錄至 ErrorReport）: "
+                        f"{cb_result.tripped_columns}"
+                    )
+                else:
+                    self.logger.debug("Circuit Breaker 檢查通過")
+            else:
+                breaker.check_and_raise(df, schema_config.columns)
+                self.logger.debug("Circuit Breaker 檢查通過")
 
         self.logger.info(f"Silver 處理完成 ({len(df)} 行)")
+
+        if return_report:
+            report = ErrorReport(
+                cast_failures=cast_failure_details,
+                cast_summary=cast_summary["failures_by_column"],
+                circuit_breaker_result=cb_result,
+                total_rows=len(df),
+            )
+            return df, report
+
         return df
+
+    def _collect_cast_failures(
+        self,
+        df_pre: pd.DataFrame,
+        df_post: pd.DataFrame,
+        column_specs: list[ColumnSpec],
+    ) -> list[CastFailureDetail]:
+        """
+        比對 cast 前後的 DataFrame，收集轉換失敗的行級別詳情
+
+        判斷條件：cast 前非空（有原始值），cast 後變為 NULL
+
+        Args:
+            df_pre: 型別轉換前的 DataFrame（apply_defaults 後）
+            df_post: 型別轉換後的 DataFrame
+            column_specs: 欄位定義列表
+
+        Returns:
+            list[CastFailureDetail]: 每筆失敗記錄含 row_index、欄位、原始字串值
+        """
+        failures: list[CastFailureDetail] = []
+
+        for spec in column_specs:
+            col = spec.target
+            if col not in df_pre.columns or col not in df_post.columns:
+                continue
+            # dtype=VARCHAR → SafeTypeCaster 跳過，不會有新增失敗
+            if spec.dtype.upper() in ("VARCHAR", "STRING", "TEXT"):
+                continue
+
+            # 找出 cast 前非空、cast 後為空的 row
+            pre_not_null = df_pre[col].notna()
+            post_is_null = df_post[col].isna()
+            failing_idx = df_pre.index[pre_not_null & post_is_null]
+
+            for idx in failing_idx:
+                failures.append(
+                    CastFailureDetail(
+                        row_index=int(idx),
+                        column=col,
+                        original_value=str(df_pre.at[idx, col]),
+                    )
+                )
+
+        return failures
 
     def _filter_empty_rows(
         self,

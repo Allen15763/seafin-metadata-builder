@@ -18,10 +18,14 @@ Example:
 import pandas as pd
 from pathlib import Path
 import logging
+from typing import TYPE_CHECKING
 
 from .config import SourceSpec, SchemaConfig
 from .reader import SourceReader
 from .processors import BronzeProcessor, SilverProcessor
+
+if TYPE_CHECKING:
+    from .reporter import ErrorReport
 
 
 class MetadataBuilder:
@@ -146,8 +150,9 @@ class MetadataBuilder:
         self,
         df: pd.DataFrame,
         schema_config: SchemaConfig,
-        validate: bool = True
-    ) -> pd.DataFrame:
+        validate: bool = True,
+        return_report: bool = False,
+    ) -> "pd.DataFrame | tuple[pd.DataFrame, ErrorReport]":
         """
         Silver: 清洗並轉換資料
 
@@ -160,27 +165,37 @@ class MetadataBuilder:
             df: Bronze 層 DataFrame
             schema_config: Schema 配置
             validate: 是否執行 Circuit Breaker 驗證
+            return_report: 為 True 時回傳 (df, ErrorReport) tuple，
+                           CircuitBreaker 觸發時不拋出例外改存入 report
 
         Returns:
-            pd.DataFrame: 清洗後的資料
+            pd.DataFrame（return_report=False）或
+            tuple[pd.DataFrame, ErrorReport]（return_report=True）
 
         Raises:
-            CircuitBreakerError: NULL 比例超過閾值
+            CircuitBreakerError: NULL 比例超過閾值（僅 return_report=False 時）
             SchemaValidationError: 必要欄位缺失
 
         Example:
             >>> df_clean = builder.transform(df_raw, schema_config)
+            >>> df_clean, report = builder.transform(df_raw, schema_config, return_report=True)
         """
         self.logger.info(f"Silver: 開始轉換 ({len(df)} 行)")
 
-        df = self.silver_processor.process(
+        result = self.silver_processor.process(
             df,
             schema_config,
-            validate=validate
+            validate=validate,
+            return_report=return_report,
         )
 
-        self.logger.info(f"Silver 完成: {len(df)} 行")
-        return df
+        if return_report:
+            df_clean, report = result
+            self.logger.info(f"Silver 完成: {len(df_clean)} 行")
+            return df_clean, report
+
+        self.logger.info(f"Silver 完成: {len(result)} 行")
+        return result
 
     # ========== 便利方法 ==========
 
@@ -192,8 +207,9 @@ class MetadataBuilder:
         header_row: int = None,
         add_metadata: bool = True,
         validate: bool = True,
+        return_report: bool = False,
         **extract_kwargs
-    ) -> pd.DataFrame:
+    ) -> "pd.DataFrame | tuple[pd.DataFrame, ErrorReport]":
         """
         一次完成 Bronze + Silver
 
@@ -204,18 +220,19 @@ class MetadataBuilder:
             header_row: Header 行
             add_metadata: 是否添加 metadata 欄位
             validate: 是否執行驗證
+            return_report: 為 True 時回傳 (df, ErrorReport) tuple，
+                           CircuitBreaker 觸發時不拋出例外改存入 report
             **extract_kwargs: 額外參數傳遞給 extract
 
         Returns:
-            pd.DataFrame: 處理完成的資料
+            pd.DataFrame（return_report=False）或
+            tuple[pd.DataFrame, ErrorReport]（return_report=True）
 
         Example:
-            >>> df = builder.build(
-            ...     './bank.xlsx',
-            ...     schema_config,
-            ...     sheet_name=0,
-            ...     header_row=2
-            ... )
+            >>> df = builder.build('./bank.xlsx', schema_config)
+            >>> df, report = builder.build('./bank.xlsx', schema_config, return_report=True)
+            >>> if report.has_errors:
+            ...     report.to_excel('./data_quality_report.xlsx')
         """
         # Bronze
         df = self.extract(
@@ -227,9 +244,7 @@ class MetadataBuilder:
         )
 
         # Silver
-        df = self.transform(df, schema_config, validate=validate)
-
-        return df
+        return self.transform(df, schema_config, validate=validate, return_report=return_report)
 
     def extract_and_preview(
         self,

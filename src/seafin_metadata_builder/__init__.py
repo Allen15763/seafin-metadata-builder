@@ -33,6 +33,7 @@ from .config import SourceSpec, SchemaConfig, ColumnSpec
 from .builder import MetadataBuilder
 from .reader import SourceReader
 from .discovery import SchemaDiscovery, SchemaDraft, ColumnInferenceResult
+from .reporter import ErrorReport, CastFailureDetail
 from .processors import BronzeProcessor, SilverProcessor
 from .transformers import ColumnMapper, SafeTypeCaster
 from .validation import CircuitBreaker, CircuitBreakerResult
@@ -56,6 +57,9 @@ __all__ = [
     "SchemaDiscovery",
     "SchemaDraft",
     "ColumnInferenceResult",
+    # 錯誤報告
+    "ErrorReport",
+    "CastFailureDetail",
     # 子組件
     "SourceReader",
     "BronzeProcessor",
