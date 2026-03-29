@@ -32,6 +32,7 @@ Example:
 from .config import SourceSpec, SchemaConfig, ColumnSpec
 from .builder import MetadataBuilder
 from .reader import SourceReader
+from .discovery import SchemaDiscovery, SchemaDraft, ColumnInferenceResult
 from .processors import BronzeProcessor, SilverProcessor
 from .transformers import ColumnMapper, SafeTypeCaster
 from .validation import CircuitBreaker, CircuitBreakerResult
@@ -51,6 +52,10 @@ __all__ = [
     "SourceSpec",
     "SchemaConfig",
     "ColumnSpec",
+    # Schema 探索工具
+    "SchemaDiscovery",
+    "SchemaDraft",
+    "ColumnInferenceResult",
     # 子組件
     "SourceReader",
     "BronzeProcessor",
